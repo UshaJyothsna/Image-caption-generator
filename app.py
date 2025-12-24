@@ -1,85 +1,94 @@
+import os
+import warnings
+import logging
+import io
+from PIL import Image
 import streamlit as st
-import numpy as np
-import pickle
-import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+import torch
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from gtts import gTTS
 
-# Load MobileNetV2 model
-mobilenet_model = MobileNetV2(weights="imagenet")
-mobilenet_model = Model(inputs=mobilenet_model.inputs, outputs=mobilenet_model.layers[-2].output)
+# ---------------- Suppress logs ----------------
 
-# Load your trained model
-model = tf.keras.models.load_model('mymodel.h5')
 
-# Load the tokenizer
-with open('tokenizer.pkl', 'rb') as tokenizer_file:
-    tokenizer = pickle.load(tokenizer_file)
-    
-# Set custom web page title
+warnings.filterwarnings("ignore")
+logging.getLogger("torch").setLevel(logging.ERROR)
+
+# ---------- Streamlit setup ----------
 st.set_page_config(page_title="Caption Generator App", page_icon="📷")
-
-# Streamlit app
-st.title("Image Caption Generator")
+st.title("📷 Image Caption Generator")
 st.markdown(
-    "Upload an image, and this app will generate a caption for it using a trained LSTM model."
+    "Upload an image, and this app will generate a caption using a "
+    "**pretrained BLIP transformer model** and also read it out loud."
 )
 
-# Upload image
-uploaded_image = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
+# ---------- Load model once ----------
+@st.cache_resource(show_spinner=True)
+def load_blip():
+    processor = BlipProcessor.from_pretrained(
+        "Salesforce/blip-image-captioning-base",
+        use_fast=True
+    )
+    model = BlipForConditionalGeneration.from_pretrained(
+        "Salesforce/blip-image-captioning-base"
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    return processor, model, device
 
-# Process uploaded image
+processor, model, device = load_blip()
+
+# ---------- Caption generation ----------
+@torch.inference_mode()
+def generate_caption(pil_image: Image.Image, max_new_tokens: int = 30) -> str:
+    image = pil_image.convert("RGB")
+    inputs = processor(image, return_tensors="pt").to(device)
+    output = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    caption = processor.decode(output[0], skip_special_tokens=True)
+    return caption.strip()
+
+# ---------- Text-to-Speech ----------
+def play_caption(caption: str):
+    audio_path = "caption.mp3"
+    tts = gTTS(text=caption, lang="en")
+    tts.save(audio_path)
+    with open(audio_path, "rb") as audio:
+        st.audio(audio, format="audio/mp3")
+
+# ---------- UI ----------
+uploaded_image = st.file_uploader(
+    "Choose an image",
+    type=["jpg", "jpeg", "png"]
+)
+
 if uploaded_image is not None:
+    pil_img = Image.open(io.BytesIO(uploaded_image.read()))
+
     st.subheader("Uploaded Image")
-    st.image(uploaded_image, caption="Uploaded Image", use_column_width=True)
+    st.image(pil_img, caption="Uploaded Image", width=500)
 
     st.subheader("Generated Caption")
-    # Display loading spinner while processing
     with st.spinner("Generating caption..."):
-        # Load image
-        image = load_img(uploaded_image, target_size=(224, 224))
-        image = img_to_array(image)
-        image = image.reshape((1, image.shape[0], image.shape[1], image.shape[2]))
-        image = preprocess_input(image)
+        try:
+            caption = generate_caption(pil_img)
+            st.success("✅ Caption generated successfully!")
+        except Exception as e:
+            st.error(f"⚠️ Caption generation failed: {e}")
+            caption = None
 
-        # Extract features using VGG16
-        image_features = mobilenet_model.predict(image, verbose=0)
-
-        # Max caption length
-        max_caption_length = 34
-        
-        # Define function to get word from index
-        def get_word_from_index(index, tokenizer):
-            return next(
-                (word for word, idx in tokenizer.word_index.items() if idx == index), None
+    if caption:
+        st.markdown(
+            f"""
+            <div style="border-left: 6px solid #ccc;
+                        padding: 10px 20px;
+                        margin-top: 20px;
+                        background:#f9f9f9;">
+                <p style="font-style: italic; font-size:18px;">
+                    “{caption}”
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-
-        # Generate caption using the model
-        def predict_caption(model, image_features, tokenizer, max_caption_length):
-            caption = "startseq"
-            for _ in range(max_caption_length):
-                sequence = tokenizer.texts_to_sequences([caption])[0]
-                sequence = pad_sequences([sequence], maxlen=max_caption_length)
-                yhat = model.predict([image_features, sequence], verbose=0)
-                predicted_index = np.argmax(yhat)
-                predicted_word = get_word_from_index(predicted_index, tokenizer)
-                caption += " " + predicted_word
-                if predicted_word is None or predicted_word == "endseq":
-                    break
-            return caption
-
-        # Generate caption
-        generated_caption = predict_caption(model, image_features, tokenizer, max_caption_length)
-
-        # Remove startseq and endseq
-        generated_caption = generated_caption.replace("startseq", "").replace("endseq", "")
-
-    # Display the generated caption with custom styling
-    st.markdown(
-        f'<div style="border-left: 6px solid #ccc; padding: 5px 20px; margin-top: 20px;">'
-        f'<p style="font-style: italic;">“{generated_caption}”</p>'
-        f'</div>',
-        unsafe_allow_html=True
-    )
+        play_caption(caption)
