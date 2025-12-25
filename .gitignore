@@ -1,0 +1,6 @@
+# Ignore generated files
+caption.mp3
+mymodel.h5
+
+# Ignore Python cache
+__pycache__/
